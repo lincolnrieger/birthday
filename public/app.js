@@ -1118,8 +1118,8 @@ function openPasswordModal() {
 // Admin settings
 
 function renderAdmin() {
-  const tabs = [['fields', 'Form fields'], ['stages', 'Workflow stages'], ['users', 'Staff accounts'], ['google', 'Google Form'], ['import', 'Import'], ['general', 'General']];
-  const panels = { fields: adminFields, stages: adminStages, users: adminUsers, google: adminGoogleForm, import: adminImport, general: adminGeneral };
+  const tabs = [['fields', 'Form fields'], ['stages', 'Workflow stages'], ['users', 'Staff accounts'], ['google', 'Google Form'], ['bookings', 'VenueLife bookings'], ['import', 'Import'], ['general', 'General']];
+  const panels = { fields: adminFields, stages: adminStages, users: adminUsers, google: adminGoogleForm, bookings: adminBookings, import: adminImport, general: adminGeneral };
   const panel = h('div', { class: 'card admin-panel' }, h('span', { class: 'muted' }, 'Loading…'));
   Promise.resolve(panels[state.adminTab]()).then((content) => panel.replaceChildren(...[content].flat(Infinity).filter(Boolean)));
   return h('div', { class: 'admin-layout' },
@@ -1689,6 +1689,104 @@ async function adminGoogleForm() {
         adminAction(() => api('admin/google-form/secret', { method: 'POST', body: {} }), 'New secret made — copy the script again');
       }
     } }, 'Make a new secret code'),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// One-off import of booked parties exported from VenueLife (CSV). Matches each booking to an enquiry
+// and moves it to Booked; bookings with no enquiry can be added as new booked enquiries.
+
+const BOOKING_COLUMNS = {
+  booking: 'booking', clientname: 'clientName', clientbookingname: 'clientBookingName', clienttype: 'clientType',
+  grouptype: 'groupType', numbers: 'numbers', numberstype: 'numbersType', status: 'status', arrival: 'arrival',
+  departure: 'departure', firstmeal: 'firstMeal', lastmeal: 'lastMeal', contactname: 'contactName',
+  contactmobile: 'contactMobile', catering: 'catering', linen: 'linen', transport: 'transport', resources: 'resources',
+  facilities: 'facilities', bookingnotes: 'bookingNotes', assignedto: 'assignedTo',
+};
+
+let bookingImport = null; // { fileName, rows, preview, addUnmatched, busy }
+
+function loadBookingsFile(file) {
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const all = parseCsv(String(reader.result));
+    const headerIndex = all.findIndex((r) => r.some((v) => squash(v) === 'booking'));
+    if (headerIndex < 0) return toast('Couldn’t find the “Booking” column. Is this the VenueLife export?', true);
+    const headers = all[headerIndex].map((v) => squash(v));
+    const rows = all.slice(headerIndex + 1).map((r) => {
+      const row = {};
+      headers.forEach((hd, i) => {
+        const key = BOOKING_COLUMNS[hd] || (hd.includes('email') ? 'email' : null);
+        if (key && r[i] && r[i].trim()) row[key] = r[i].trim();
+      });
+      return row;
+    }).filter((r) => Object.keys(r).length);
+    bookingImport = { fileName: file.name, rows, preview: null, addUnmatched: true, busy: true };
+    renderApp();
+    try {
+      bookingImport.preview = await api('admin/import-bookings', { method: 'POST', body: { rows, apply: false } });
+    } catch (ex) {
+      toast(ex.message, true);
+      bookingImport = null;
+    }
+    if (bookingImport) bookingImport.busy = false;
+    renderApp();
+  };
+  reader.readAsText(file);
+}
+
+function adminBookings() {
+  const intro = [
+    h('div', { class: 'head' }, h('h2', {}, 'Import VenueLife bookings')),
+    h('p', { class: 'muted' }, 'A one-off tidy-up: export the birthday bookings from VenueLife as CSV and choose the file below. Each booking is matched to its enquiry, by email first, then mobile number, then contact name. Matched enquiries move to ',
+      h('strong', {}, state.config.stages.find((s) => s.is_won)?.name || 'Booked'), ' and get “Booked in VenueLife” ticked and the party date filled in. Repeat lines for the same booking are combined, and cancelled bookings are skipped. You see what will happen before anything changes, and importing the same file again won’t double up.'),
+  ];
+  const picker = h('input', { type: 'file', accept: '.csv,text/csv', onchange: (e) => e.target.files[0] && loadBookingsFile(e.target.files[0]) });
+  if (!bookingImport) return [...intro, picker];
+  const { fileName, rows, preview, busy } = bookingImport;
+  const head = h('div', { class: 'list-row' },
+    h('div', { class: 'grow' }, h('strong', {}, fileName), h('div', { class: 'muted small' }, `${rows.length} rows in the file`)),
+    h('button', { onclick: () => { bookingImport = null; renderApp(); } }, 'Choose a different file'));
+  if (busy || !preview) return [...intro, head, h('p', { class: 'muted' }, 'Matching bookings to enquiries…')];
+
+  const table = (cols, items) => h('div', { class: 'table-wrap import-map' }, h('table', {},
+    h('thead', {}, h('tr', {}, cols.map(([label]) => h('th', { class: 'nosort' }, label)))),
+    h('tbody', {}, items.map((it) => h('tr', {}, cols.map(([, get]) => h('td', {}, get(it) ?? '')))))));
+  const section = (title, count, content, open = false) =>
+    h('details', { class: 'import-group', open: open || undefined }, h('summary', {}, h('strong', {}, `${title}: ${count}`)), count ? content : h('p', { class: 'muted small' }, 'None.'));
+
+  const { matched, unmatched, skipped } = preview;
+  const status = h('span', { class: 'muted' });
+  const run = async (btn) => {
+    btn.disabled = true;
+    status.textContent = 'Importing…';
+    try {
+      const r = await api('admin/import-bookings', { method: 'POST', body: { rows, apply: true, addUnmatched: bookingImport.addUnmatched } });
+      bookingImport = null;
+      await Promise.all([refreshEnquiries(), refreshConfig()]);
+      toast(`${r.matched.length} enquiries moved to booked${r.addUnmatched ? `, ${r.unmatched.length} bookings added` : ''}`);
+      state.view = 'list';
+      renderApp();
+    } catch (ex) {
+      btn.disabled = false;
+      status.textContent = ex.message;
+    }
+  };
+  const total = matched.length + (bookingImport.addUnmatched ? unmatched.length : 0);
+  return [
+    ...intro, head,
+    section('Matched to an enquiry (will move to booked)', matched.length,
+      table([['Booking', (x) => '#' + x.booking], ['Enquiry', (x) => x.enquiry], ['VenueLife contact', (x) => x.contact], ['Matched by', (x) => x.by]], matched), true),
+    section('No matching enquiry', unmatched.length, [
+      table([['Booking', (x) => '#' + x.booking], ['Booking name', (x) => x.name], ['Contact', (x) => x.contact], ['Arrival', (x) => fmtDate(x.arrival)]], unmatched),
+    ], true),
+    h('label', { class: 'check', style: { margin: '10px 0' } },
+      h('input', { type: 'checkbox', checked: bookingImport.addUnmatched, onchange: (e) => { bookingImport.addUnmatched = e.target.checked; renderApp(); } }),
+      `Add the ${unmatched.length === 1 ? 'unmatched booking as a new booked enquiry' : `${unmatched.length} unmatched bookings as new booked enquiries`} (the other VenueLife details go into Staff notes)`),
+    section('Skipped', skipped.length, table([['Row', (x) => x.booking], ['Why', (x) => x.reason]], skipped)),
+    h('div', { style: { display: 'flex', gap: '12px', alignItems: 'center', marginTop: '14px' } },
+      h('button', { class: 'primary', disabled: !total, onclick: (e) => run(e.target) }, `Import ${total} booking${total === 1 ? '' : 's'}`),
+      status),
   ];
 }
 

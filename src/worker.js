@@ -147,6 +147,7 @@ async function route(request, env, url) {
 
     if (resource === 'settings' && method === 'PUT') return updateSettings(request, db);
     if (resource === 'import' && method === 'POST') return importEnquiries(request, db, user);
+    if (resource === 'import-bookings' && method === 'POST') return importBookings(request, db, user);
     if (resource === 'google-form') {
       if (!sub && method === 'GET') return json({ secret: await googleFormSecret(db, false), url: `${url.origin}/api/google-form` });
       if (sub === 'secret' && method === 'POST') return json({ secret: await googleFormSecret(db, true), url: `${url.origin}/api/google-form` });
@@ -731,6 +732,8 @@ async function addNote(request, db, user, id) {
 
 const MAX_IMPORT_ROWS = 200;
 
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
 // Accepts 2027-03-06, 6/3/2027, 6-3-27, 6.3.2027 (day first, as in Australia), with or without a time after it.
 function parseImportDate(raw) {
   const s = String(raw).trim();
@@ -740,6 +743,11 @@ function parseImportDate(raw) {
   else if ((m = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2}|\d{4})(?:[ T,].*)?$/))) {
     [, d, mo, y] = m.map(Number);
     if (y < 100) y += 2000;
+  } else if ((m = s.match(/(\d{1,2})(?:st|nd|rd|th)?[\s-]+([a-z]{3,9})\.?,?[\s-]+(\d{4})/i))) {
+    // "Sat 5 Dec 2026", "05-Dec-2026", "5 December 2026 10:00 AM"
+    mo = MONTHS.indexOf(m[2].slice(0, 3).toLowerCase()) + 1;
+    if (!mo) return null;
+    [d, y] = [Number(m[1]), Number(m[3])];
   } else return null;
   const date = new Date(Date.UTC(y, mo - 1, d));
   if (date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d) return null;
@@ -818,6 +826,163 @@ async function importEnquiries(request, db, user) {
   }
   await db.batch(statements);
   return json({ imported: rows.length, newOptions: Object.fromEntries(newOptions) });
+}
+
+// ---------------------------------------------------------------------------
+// Admin: one-off import of booked parties exported from VenueLife.
+// Each booking is matched to an enquiry (by email, then mobile, then contact name). Matches move to the
+// "booked" stage and get "Booked in VenueLife" ticked; bookings with no matching enquiry are added as booked.
+// Send { rows, apply: false } first to preview what would happen, then { rows, apply: true }.
+
+const MAX_BOOKING_ROWS = 1000;
+const EMAIL_RE = /[a-z0-9._%+'-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+
+const emailsIn = (text) => (String(text ?? '').match(EMAIL_RE) || []).map((e) => e.toLowerCase());
+
+// Australian mobiles/phones compared by their last 9 digits, so 0412 345 678 = +61 412 345 678.
+function phonesIn(text) {
+  return (String(text ?? '').match(/\+?\d[\d\s().-]{7,}\d/g) || [])
+    .map((p) => p.replace(/\D/g, ''))
+    .filter((p) => p.length >= 9)
+    .map((p) => p.slice(-9));
+}
+
+const VENUELIFE_FIELD = { key: 'venuelife_booking', label: 'VenueLife booking #', type: 'text', section: 'Booking' };
+
+async function ensureVenueLifeField(db, fields) {
+  if (fields.some((f) => f.key === VENUELIFE_FIELD.key)) return;
+  const after = fields.find((f) => f.key === 'booked_venuelife');
+  const max = await db.prepare('SELECT COALESCE(MAX(position), 0) AS p FROM fields').first();
+  await db.prepare(
+    `INSERT OR IGNORE INTO fields (key, label, type, options, config, section, required, show_in_list, position)
+     VALUES (?, ?, ?, '[]', '{}', ?, 0, 0, ?)`
+  ).bind(VENUELIFE_FIELD.key, VENUELIFE_FIELD.label, VENUELIFE_FIELD.type, after ? after.section : VENUELIFE_FIELD.section, max.p + 1).run();
+}
+
+async function importBookings(request, db, user) {
+  const body = await readJson(request);
+  const rows = Array.isArray(body.rows) ? body.rows : [];
+  if (!rows.length) throw new HttpError(400, 'Nothing to import.');
+  if (rows.length > MAX_BOOKING_ROWS) throw new HttpError(400, `Send at most ${MAX_BOOKING_ROWS} bookings at a time.`);
+  const apply = body.apply === true;
+  const addUnmatched = body.addUnmatched !== false;
+
+  if (apply) await ensureVenueLifeField(db, (await loadFields(db, true)));
+  const ctx = await loadWriteContext(db);
+  const fieldKeys = new Set(ctx.fields.map((f) => f.key));
+  const stages = (await loadStages(db));
+  const booked = stages.find((s) => s.is_won);
+  if (!booked) throw new HttpError(400, 'No stage is marked as “booked”. Tick “This stage means the party is booked” on one in Workflow stages.');
+  const { results } = await db.prepare(`${ENQUIRY_SELECT} ORDER BY e.created_at DESC, e.id DESC`).all();
+  const enquiries = results.map(rowToEnquiry).map((e) => {
+    const all = Object.values(e.data).join(' \n ');
+    return {
+      e,
+      emails: new Set(emailsIn(all)),
+      phones: new Set(phonesIn([e.data.phone, e.data.email, e.data.contact_name].join(' '))),
+      name: squash(e.data.contact_name || ''),
+      booking: String(e.data.venuelife_booking || '').trim(),
+    };
+  });
+
+  // Consolidate: one entry per booking number (an export can list a booking on several lines).
+  const bookings = new Map();
+  const skipped = [];
+  for (const raw of rows) {
+    const r = raw && typeof raw === 'object' ? raw : {};
+    const number = str(r.booking, 60);
+    const label = number ? `#${number}` : str(r.clientBookingName || r.contactName || r.clientName, 100) || '(blank row)';
+    if (!number) { skipped.push({ booking: label, reason: 'No booking number' }); continue; }
+    if (/cancel/i.test(String(r.status || ''))) { skipped.push({ booking: label, reason: `Status: ${str(r.status, 40)}` }); continue; }
+    const prev = bookings.get(number);
+    if (!prev) bookings.set(number, { ...r, booking: number });
+    else for (const [k, v] of Object.entries(r)) if (!str(prev[k]) && str(v)) prev[k] = v; // fill gaps from repeat lines
+  }
+
+  const used = new Set();
+  const plan = [];
+  for (const b of bookings.values()) {
+    const text = Object.values(b).join(' \n ');
+    const emails = emailsIn(text);
+    const phones = phonesIn([b.contactMobile, b.contactName, b.clientName, b.bookingNotes].join(' '));
+    const names = [b.contactName, b.clientName].map((n) => squash(n || '')).filter((n) => n.length >= 4);
+    const free = (c) => !used.has(c.e.id);
+    // Already imported (same booking number) → same enquiry, so running the import twice changes nothing.
+    let match = enquiries.find((c) => c.booking === b.booking);
+    let how = match ? 'booking number' : null;
+    const tryBy = (label, test) => {
+      if (match) return;
+      const hits = enquiries.filter((c) => free(c) && !c.booking && test(c));
+      // Prefer an enquiry that isn't booked yet, then the most recent one.
+      const pick = hits.find((c) => !stages.find((s) => s.id === c.e.stage_id)?.is_won) || hits[0];
+      if (pick) { match = pick; how = label; }
+    };
+    tryBy('email', (c) => emails.some((x) => c.emails.has(x)));
+    tryBy('mobile', (c) => phones.some((x) => c.phones.has(x)));
+    tryBy('contact name', (c) => c.name && names.includes(c.name));
+    if (match) used.add(match.e.id);
+    plan.push({ b, match, how, arrival: parseImportDate(b.arrival || '') });
+  }
+
+  const summary = {
+    matched: plan.filter((p) => p.match).map((p) => ({
+      booking: p.b.booking, enquiry: p.match.e.data.child_name || p.match.e.data.contact_name || `Enquiry #${p.match.e.id}`,
+      by: p.how, contact: str(p.b.contactName || p.b.clientName, 100),
+    })),
+    unmatched: plan.filter((p) => !p.match).map((p) => ({
+      booking: p.b.booking, name: str(p.b.clientBookingName || p.b.clientName, 100), contact: str(p.b.contactName, 100), arrival: p.arrival,
+    })),
+    skipped,
+    addUnmatched,
+  };
+  if (!apply) return json(summary);
+
+  const set = (data, key, value) => { if (fieldKeys.has(key) || key === VENUELIFE_FIELD.key) data[key] = value; };
+  const statements = [];
+  for (const p of plan) {
+    if (p.match) {
+      const e = p.match.e;
+      const data = { ...e.data };
+      set(data, 'booked_venuelife', true);
+      set(data, VENUELIFE_FIELD.key, p.b.booking);
+      if (p.arrival && !data.confirmed_date) set(data, 'confirmed_date', p.arrival);
+      const moved = e.stage_id !== booked.id;
+      statements.push(
+        db.prepare("UPDATE enquiries SET data = ?, stage_id = ?, stage_history = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(JSON.stringify(data), booked.id, JSON.stringify(withStage(e.stage_history, booked.id)), user.id, e.id),
+        db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (?, ?, 'updated', ?)")
+          .bind(e.id, user.id, `Matched to VenueLife booking #${p.b.booking} (by ${p.how})${moved ? ` — moved to ${booked.name}` : ''}`)
+      );
+    } else if (addUnmatched) {
+      const data = {};
+      const b = p.b;
+      set(data, 'child_name', str(b.clientBookingName || b.clientName, 500));
+      set(data, 'contact_name', str(b.contactName || b.clientName, 500));
+      set(data, 'phone', str(b.contactMobile, 500));
+      const email = emailsIn(Object.values(b).join(' '))[0];
+      if (email) set(data, 'email', email);
+      if (str(b.numbers)) set(data, 'kids', str(b.numbers, 500));
+      if (p.arrival) set(data, 'confirmed_date', p.arrival);
+      set(data, 'booked_venuelife', true);
+      set(data, VENUELIFE_FIELD.key, b.booking);
+      // Everything else from VenueLife goes into the staff notes so nothing is lost.
+      const extras = [
+        ['Client', b.clientName], ['Client type', b.clientType], ['Group type', b.groupType], ['Numbers type', b.numbersType],
+        ['Status', b.status], ['Arrival', b.arrival], ['Departure', b.departure], ['First meal', b.firstMeal], ['Last meal', b.lastMeal],
+        ['Catering', b.catering], ['Linen', b.linen], ['Transport', b.transport], ['Resources', b.resources],
+        ['Facilities', b.facilities], ['Booking notes', b.bookingNotes], ['VenueLife assigned to', b.assignedTo],
+      ].filter(([, v]) => str(v)).map(([k, v]) => `${k}: ${str(v, 2000)}`);
+      if (extras.length) set(data, 'comments', ['From VenueLife:', ...extras].join('\n').slice(0, 10000));
+      statements.push(
+        db.prepare('INSERT INTO enquiries (stage_id, data, created_by, updated_by, stage_history) VALUES (?, ?, ?, ?, ?)')
+          .bind(booked.id, JSON.stringify(data), user.id, user.id, JSON.stringify([booked.id])),
+        db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (last_insert_rowid(), ?, 'created', ?)")
+          .bind(user.id, `Imported from VenueLife booking #${b.booking} (no matching enquiry)`)
+      );
+    }
+  }
+  if (statements.length) await db.batch(statements);
+  return json({ ...summary, applied: true });
 }
 
 // ---------------------------------------------------------------------------
