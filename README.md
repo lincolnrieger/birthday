@@ -23,6 +23,7 @@ A web app for logging and following up birthday party enquiries. New enquiries a
     - **Workflow stages**: add, rename, recolour, reorder or delete stages, and mark which stages count as "booked" and "lost".
     - **Staff accounts**: add people, switch roles, and deactivate people who leave. When you add someone, you get a **link to send them**. They open it and choose their own password. **Get password reset link** does the same for anyone who forgets their password. Links work once and expire after 7 days.
     - **Import**: bring in enquiries from a spreadsheet saved as CSV. Columns are matched to fields automatically, and you can change any match before importing. Dates like 26/10/2026 work. Values that don't fit their field are kept in Comments. New dropdown choices are added automatically.
+    - **VenueLife bookings**: a one-off import of the booked-parties report exported from VenueLife as CSV. Each booking is matched to its enquiry by email (found anywhere in the row), then mobile number, then contact name. Matched enquiries move to *Booked*, get *Booked in VenueLife* ticked, the party date filled in from *Arrival*, and the booking number saved. Repeat lines for one booking are combined, cancelled bookings are skipped, and bookings with no matching enquiry can be added as new booked enquiries. You see a preview first, and re-importing the same file changes nothing.
     - **General**: the venue or app name.
 
 ## Connecting the Google Form
