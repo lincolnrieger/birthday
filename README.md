@@ -22,8 +22,8 @@ A web app for logging and following up birthday party enquiries. New enquiries a
     - **Form fields**: add, rename, reorder or remove fields. Each field can be linked to a Google Form question. Field types are tick box, dropdown, date, text, long text, number, email, phone, and "days between two dates" (calculated automatically). Removed fields keep their saved answers and can be restored.
     - **Workflow stages**: add, rename, recolour, reorder or delete stages, and mark which stages count as "booked" and "lost".
     - **Staff accounts**: add people, switch roles, and deactivate people who leave. When you add someone, you get a **link to send them**. They open it and choose their own password. **Get password reset link** does the same for anyone who forgets their password. Links work once and expire after 7 days.
-    - **Import**: bring in enquiries from a spreadsheet saved as CSV. Columns are matched to fields automatically, and you can change any match before importing. Dates like 26/10/2026 work. Values that don't fit their field are kept in Comments. New dropdown choices are added automatically.
-    - **VenueLife bookings**: a one-off import of the booked-parties report exported from VenueLife as CSV. Each booking is matched to its enquiry by email (found anywhere in the row), then mobile number, then contact name. Matched enquiries move to *Booked*, get *Booked in VenueLife* ticked, the party date filled in from *Arrival*, and the booking number saved. Repeat lines for one booking are combined, cancelled bookings are skipped, and bookings with no matching enquiry can be added as new booked enquiries. You see a preview first, and re-importing the same file changes nothing.
+    - **Import**: bring in enquiries from an Excel file or CSV. Columns are matched to fields automatically, and you can change any match before importing. Dates like 26/10/2026 work. Values that don't fit their field are kept in Comments. New dropdown choices are added automatically.
+    - **VenueLife bookings**: a one-off import of the booked-parties report exported from VenueLife (Excel or CSV). Each booking is matched to its enquiry by email (found anywhere in the row), then mobile number, then contact name. Matched enquiries move to *Booked*, get *Booked in VenueLife* ticked, the party date filled in from *Arrival*, and the booking number saved. Repeat lines for one booking are combined, cancelled bookings are skipped, and bookings with no matching enquiry can be added as new booked enquiries. You see a preview first, and re-importing the same file changes nothing.
     - **General**: the venue or app name.
 
 ## Connecting the Google Form
@@ -79,7 +79,7 @@ npm run dev        # sets up a local database and serves http://localhost:8787
 
 ```
 src/worker.js        API: auth, enquiries, Google Form webhook, admin (fields/stages/users)
-public/              Frontend (plain HTML/CSS/JS, no build step)
+public/              Frontend (plain HTML/CSS/JS, no build step; vendor/ holds the SheetJS Excel reader)
 migrations/          D1 schema and default fields and stages
 wrangler.jsonc       Cloudflare config (Worker + static assets + D1 binding)
 ```

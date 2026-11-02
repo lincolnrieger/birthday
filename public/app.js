@@ -1456,10 +1456,52 @@ function guessColumn(header) {
   return partial ? partial.key : '';
 }
 
+// Spreadsheet files people can import: CSV, or Excel straight from Excel / VenueLife.
+const SPREADSHEET_ACCEPT = '.csv,.xlsx,.xls,.xlsm,.ods,.tsv,.txt,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+// The Excel reader (SheetJS) is only downloaded the first time someone picks an Excel file.
+let xlsxLib = null;
+function loadXlsx() {
+  xlsxLib ??= new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = '/vendor/xlsx-0.18.5.full.min.js';
+    el.onload = () => resolve(window.XLSX);
+    el.onerror = () => { xlsxLib = null; reject(new Error('Couldn’t load the Excel reader. Check your connection and try again.')); };
+    document.head.append(el);
+  });
+  return xlsxLib;
+}
+
+// Read a CSV or Excel file into rows of text cells.
+async function readSpreadsheet(file) {
+  if (/\.(csv|txt)$/i.test(file.name)) return parseCsv(await file.text());
+  if (/\.tsv$/i.test(file.name)) {
+    return (await file.text()).split(/\r?\n/).map((l) => l.split('\t')).filter((r) => r.some((v) => v.trim()));
+  }
+  const XLSX = await loadXlsx();
+  const book = XLSX.read(await file.arrayBuffer(), { type: 'array', cellNF: true });
+  // Use the first sheet that has something in it.
+  const sheet = book.SheetNames.map((n) => book.Sheets[n]).find((ws) => ws['!ref']) || book.Sheets[book.SheetNames[0]];
+  // Write date cells as 2026-12-05 10:00 so a US-style "12/5/26" format can't be read as 12 May.
+  for (const [ref, cell] of Object.entries(sheet)) {
+    if (ref[0] !== '!' && cell.t === 'n' && cell.z && XLSX.SSF.is_date(cell.z)) {
+      cell.w = XLSX.SSF.format(cell.v % 1 ? 'yyyy-mm-dd hh:mm' : 'yyyy-mm-dd', cell.v);
+    }
+  }
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+  return rows.map((r) => r.map((v) => String(v ?? ''))).filter((r) => r.some((v) => v.trim()));
+}
+
+// Read the chosen file, then hand its rows on. Shows a message if it can't be read.
+async function withSpreadsheet(file, use) {
+  let rows;
+  try { rows = await readSpreadsheet(file); }
+  catch (ex) { return toast(ex.message || 'Couldn’t read that file.', true); }
+  return use(rows);
+}
+
 function loadImportFile(file) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    const all = parseCsv(String(reader.result));
+  return withSpreadsheet(file, (all) => {
     // The heading row is the first row with at least 3 filled-in cells (skips titles above the table).
     const headerIndex = all.findIndex((r) => r.filter((v) => v.trim()).length >= 3);
     if (headerIndex < 0) return toast('Couldn’t find a heading row in that file.', true);
@@ -1474,16 +1516,15 @@ function loadImportFile(file) {
     });
     importState = { fileName: file.name, headers, rows, mapping };
     renderApp();
-  };
-  reader.readAsText(file);
+  });
 }
 
 function adminImport() {
   const intro = [
     h('div', { class: 'head' }, h('h2', {}, 'Import enquiries')),
-    h('p', { class: 'muted' }, 'Bring in enquiries from a spreadsheet. In Excel or Google Sheets, save the sheet as CSV (File → Save As → CSV), then choose it below. You can check which column goes where before anything is saved.'),
+    h('p', { class: 'muted' }, 'Bring in enquiries from a spreadsheet. In Excel or Google Sheets, choose the Excel file or CSV below (from Google Sheets: File → Download → Microsoft Excel or CSV). You can check which column goes where before anything is saved.'),
   ];
-  const picker = h('input', { type: 'file', accept: '.csv,text/csv', onchange: (e) => e.target.files[0] && loadImportFile(e.target.files[0]) });
+  const picker = h('input', { type: 'file', accept: SPREADSHEET_ACCEPT, onchange: (e) => e.target.files[0] && loadImportFile(e.target.files[0]) });
   if (!importState) return [...intro, picker];
 
   const { headers, rows, mapping, fileName } = importState;
@@ -1707,9 +1748,7 @@ const BOOKING_COLUMNS = {
 let bookingImport = null; // { fileName, rows, preview, addUnmatched, busy }
 
 function loadBookingsFile(file) {
-  const reader = new FileReader();
-  reader.onload = async () => {
-    const all = parseCsv(String(reader.result));
+  return withSpreadsheet(file, async (all) => {
     const headerIndex = all.findIndex((r) => r.some((v) => squash(v) === 'booking'));
     if (headerIndex < 0) return toast('Couldn’t find the “Booking” column. Is this the VenueLife export?', true);
     const headers = all[headerIndex].map((v) => squash(v));
@@ -1731,17 +1770,16 @@ function loadBookingsFile(file) {
     }
     if (bookingImport) bookingImport.busy = false;
     renderApp();
-  };
-  reader.readAsText(file);
+  });
 }
 
 function adminBookings() {
   const intro = [
     h('div', { class: 'head' }, h('h2', {}, 'Import VenueLife bookings')),
-    h('p', { class: 'muted' }, 'A one-off tidy-up: export the birthday bookings from VenueLife as CSV and choose the file below. Each booking is matched to its enquiry, by email first, then mobile number, then contact name. Matched enquiries move to ',
+    h('p', { class: 'muted' }, 'A one-off tidy-up: export the birthday bookings from VenueLife (Excel or CSV) and choose the file below. Each booking is matched to its enquiry, by email first, then mobile number, then contact name. Matched enquiries move to ',
       h('strong', {}, state.config.stages.find((s) => s.is_won)?.name || 'Booked'), ' and get “Booked in VenueLife” ticked and the party date filled in. Repeat lines for the same booking are combined, and cancelled bookings are skipped. You see what will happen before anything changes, and importing the same file again won’t double up.'),
   ];
-  const picker = h('input', { type: 'file', accept: '.csv,text/csv', onchange: (e) => e.target.files[0] && loadBookingsFile(e.target.files[0]) });
+  const picker = h('input', { type: 'file', accept: SPREADSHEET_ACCEPT, onchange: (e) => e.target.files[0] && loadBookingsFile(e.target.files[0]) });
   if (!bookingImport) return [...intro, picker];
   const { fileName, rows, preview, busy } = bookingImport;
   const head = h('div', { class: 'list-row' },
