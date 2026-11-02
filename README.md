@@ -1,0 +1,91 @@
+# Birthday Enquiry Tracker
+
+A web app for logging and following up birthday party enquiries. New enquiries arrive by themselves from the Google Form. It runs on **Cloudflare Workers**, and the data lives in a **Cloudflare D1** database.
+
+## What it does
+
+- **Google Form connection**: every form response becomes a new enquiry in the *New enquiry* stage. See [Connecting the Google Form](#connecting-the-google-form).
+- **Tracking**: stages go *New enquiry → Responded → Booked* (or *Lost / declined*). Each enquiry has *Date responded*, a *Dates offered* box for the dates you've offered, a *Confirmed party date*, and a checklist: **Booked in VenueLife** and **Rostered**. You can tick these straight from the list or the board.
+- **Add new enquiry**: one button opens a form with all the enquiry details. The first date field is pre-filled with today's date.
+- **Enquiries list**: search, filter by stage and sort any column. You can change an enquiry's stage, and tick or untick checklist items, straight from the list. The stage and name columns stay pinned while you scroll sideways.
+- **Auto-save**: changes to an enquiry save by themselves as you type, and straight away when you tick, pick or click out of a box. There's no Save button to forget. If you close a half-filled *new* enquiry, you're asked whether to add it, keep it as a draft or discard it. Drafts are kept in your browser, even through a refresh, until you finish them.
+- **Live updates for everyone**: the app pulls the latest from the database when you switch tabs, close a form, finish saving or come back to the window, and every 15 seconds while it's open. The header shows "✓ Up to date" with the time of the last check (click it to check now). You also get a message when other people have made changes.
+- **Conversion & drop-off** (Summary): how many enquiries reached each stage, what share went on to the next stage, and how many were lost after each one. For example, it shows enquiries lost after you responded separately from bookings that were later cancelled. It works from every stage an enquiry has been in.
+- **Instant saving**: changes appear on screen straight away and save to the database in the background. "Saving…" shows in the header until the save finishes. If a save fails, you get a message and the list reloads from the database.
+- **Board**: drag enquiries between workflow stages (New enquiry → Responded → Booked / Lost).
+- **Notes and history**: every change is logged with who made it and when. You can also add notes, such as a phone call or a follow-up.
+- **Summary**: totals, conversion rate, average days to confirm, breakdowns by stage, by source and by any other dropdown, checklist progress, and enquiries per month.
+- **Export CSV**: download the current list to open in Excel.
+- **Accounts**:
+  - *Party staff* can add, edit and update enquiries.
+  - *Admins* can also delete enquiries and use **Admin settings**:
+    - **Form fields**: add, rename, reorder or remove fields. Each field can be linked to a Google Form question. Field types are tick box, dropdown, date, text, long text, number, email, phone, and "days between two dates" (calculated automatically). Removed fields keep their saved answers and can be restored.
+    - **Workflow stages**: add, rename, recolour, reorder or delete stages, and mark which stages count as "booked" and "lost".
+    - **Staff accounts**: add people, switch roles, and deactivate people who leave. When you add someone, you get a **link to send them**. They open it and choose their own password. **Get password reset link** does the same for anyone who forgets their password. Links work once and expire after 7 days.
+    - **Import**: bring in enquiries from a spreadsheet saved as CSV. Columns are matched to fields automatically, and you can change any match before importing. Dates like 26/10/2026 work. Values that don't fit their field are kept in Comments. New dropdown choices are added automatically.
+    - **General**: the venue or app name.
+
+## Connecting the Google Form
+
+The form's response spreadsheet runs a small Google Apps Script that sends each response to the tracker.
+
+1. Sign in as an admin and open **Admin settings → Google Form**. Click **Copy script**.
+2. Open the Google Form → **Responses** → **View in Sheets**. In the spreadsheet, open **Extensions → Apps Script**, replace everything with the copied script and save.
+3. Choose **setup** in the function list and click **Run**. Allow access when Google asks.
+
+`setup` sends every response already in the sheet and adds a trigger so every new response arrives by itself. Each response is identified by its timestamp and email, so sending it again never creates a duplicate. The spreadsheet gets a **Tracker** menu to re-send everything.
+
+Answers go into the field whose "Google Form question" matches the column heading (Admin settings → Form fields). If you reword a question in the form, update that field to match. Answers that don't match any field are kept in "Anything else (from form)". New dropdown answers, such as a new package name, are added to the dropdown automatically.
+
+The script contains a secret code. Only requests with that code can add enquiries. **Make a new secret code** on the Google Form page replaces it, after which you need to paste the script in again.
+
+## First run
+
+Open the deployed site. Because the database has no users yet, it asks you to create the **admin account**. After that, add staff from **Admin settings → Staff accounts**.
+
+## Deploying (GitHub → Cloudflare)
+
+You don't need to set up a database by hand. On the first deploy, Wrangler creates a D1 database called `birthday-enquiries` in your Cloudflare account. The app creates its tables the first time someone opens it.
+
+1. In the Cloudflare dashboard, go to **Workers & Pages → Create → Import a repository**. Pick this GitHub repo.
+2. Leave the build command empty. The deploy command is `npx wrangler deploy`, which is the default.
+3. Deploy. Every push to `main` then redeploys automatically.
+
+To deploy from your own computer instead, run `npm install`, then `npx wrangler login`, then `npm run deploy`.
+
+### If a Cloudflare build fails
+
+- **Fails instantly with no log**: Cloudflare couldn't read the repo. In GitHub, open **Settings → Integrations → Applications → Cloudflare Workers and Pages → Configure** and make sure this repo is selected. Then click **Retry build** in Cloudflare.
+- **"name mismatch"**: the Worker in Cloudflare must be called `birthday-enquiry-tracker`, the same as `name` in `wrangler.jsonc`.
+- **Node version errors**: `.node-version` pins Node 22, which Wrangler 4 requires.
+
+### GitHub branches
+
+`main` is the branch Cloudflare deploys. Make it the default branch in GitHub under **Settings → General → Default branch**. Changes are made on another branch and merged into `main` with a pull request. Each merge redeploys the site.
+
+### Database changes
+
+All the customisation (fields, stages, accounts) is stored as data, so day-to-day changes never need a database migration. When a developer adds a new file to `migrations/`, they also add it to the `MIGRATIONS` list in `src/worker.js`. The app then applies it automatically the next time it starts.
+
+## Local development
+
+```bash
+npm install
+npm run dev        # sets up a local database and serves http://localhost:8787
+```
+
+## Project layout
+
+```
+src/worker.js        API: auth, enquiries, Google Form webhook, admin (fields/stages/users)
+public/              Frontend (plain HTML/CSS/JS, no build step)
+migrations/          D1 schema and default fields and stages
+wrangler.jsonc       Cloudflare config (Worker + static assets + D1 binding)
+```
+
+## Security notes
+
+- Passwords have no minimum length. They are hashed with PBKDF2-SHA256 (100k iterations). Sessions are random tokens, and the database stores only their hashes. The session cookie is HttpOnly, Secure and SameSite=Lax.
+- After 5 wrong passwords, the account is locked for 15 minutes.
+- Deactivating a user, changing their role or resetting their password signs them out everywhere.
+- Invite and reset links are random, single-use and expire after 7 days. The database stores only their hashes. The code sits after the `#` in the link, so it never shows up in server logs.
