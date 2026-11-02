@@ -27,13 +27,13 @@ A web app for logging and following up birthday party enquiries. New enquiries a
 
 ## Connecting the Google Form
 
-The form's response spreadsheet runs a small Google Apps Script that sends each response to the tracker.
+You only need edit access to the Google Sheet that collects the form responses. A small Google Apps Script in that sheet sends each response to the tracker.
 
 1. Sign in as an admin and open **Admin settings → Google Form**. Click **Copy script**.
-2. Open the Google Form → **Responses** → **View in Sheets**. In the spreadsheet, open **Extensions → Apps Script**, replace everything with the copied script and save.
+2. Open the response Google Sheet, then **Extensions → Apps Script**. Replace everything with the copied script and save.
 3. Choose **setup** in the function list and click **Run**. Allow access when Google asks.
 
-`setup` sends every response already in the sheet and adds a trigger so every new response arrives by itself. Each response is identified by its timestamp and email, so sending it again never creates a duplicate. The spreadsheet gets a **Tracker** menu to re-send everything.
+`setup` sends every response already in the sheet. New responses then arrive by themselves: straight away if the form is linked to the sheet, and through a check every 10 minutes either way. Each response is identified by its timestamp and email, so sending it again never creates a duplicate. The sheet gets a **Tracker** menu to re-send everything.
 
 Answers go into the field whose "Google Form question" matches the column heading (Admin settings → Form fields). If you reword a question in the form, update that field to match. Answers that don't match any field are kept in "Anything else (from form)". New dropdown answers, such as a new package name, are added to the dropdown automatically.
 

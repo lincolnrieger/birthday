@@ -1548,18 +1548,23 @@ function adminImport() {
 
 function appsScript(url, secret) {
   return `// ${state.config.appName}: sends Google Form responses to the enquiry tracker.
-// Paste into the response spreadsheet: Extensions → Apps Script. Then run "setup" once.
+// Paste into the Google Sheet that gets the form responses: Extensions → Apps Script. Then run "setup" once.
 const TRACKER_URL = ${JSON.stringify(url)};
 const TRACKER_SECRET = ${JSON.stringify(secret)};
 
-// Run once: sends every new form response to the tracker automatically from now on,
-// and sends all the responses already in the sheet.
+// Run once. Sends all the responses already in the sheet, then keeps sending new ones by itself:
+// straight away when the form is linked to this sheet, and with a check every 10 minutes either way.
 function setup() {
   const ss = SpreadsheetApp.getActive();
   ScriptApp.getProjectTriggers()
-    .filter((t) => t.getHandlerFunction() === 'onFormSubmit')
+    .filter((t) => ['onFormSubmit', 'sendNewResponses'].includes(t.getHandlerFunction()))
     .forEach((t) => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('onFormSubmit').forSpreadsheet(ss).onFormSubmit().create();
+  try {
+    ScriptApp.newTrigger('onFormSubmit').forSpreadsheet(ss).onFormSubmit().create();
+  } catch (err) {
+    Logger.log('Form submit trigger not added (' + err + '). The 10-minute check will pick up new responses.');
+  }
+  ScriptApp.newTrigger('sendNewResponses').timeBased().everyMinutes(10).create();
   sendAllResponses();
 }
 
@@ -1570,31 +1575,54 @@ function onOpen() {
     .addToUi();
 }
 
-// Runs by itself every time someone submits the form.
+// Runs by itself when someone submits the form (if the form is linked to this sheet).
 function onFormSubmit(e) {
   const sheet = e.range.getSheet();
-  post([responseFromRow(sheet, e.range.getRow())]);
+  const r = responseFromRow(sheet, e.range.getRow());
+  if (r) post([r]);
+}
+
+// Runs by itself every 10 minutes: sends rows added since the last check (plus the last 50 rows,
+// in case rows were moved). Responses already in the tracker are skipped.
+function sendNewResponses() {
+  const props = PropertiesService.getScriptProperties();
+  const sheet = responseSheet();
+  const last = sheet.getLastRow();
+  const sent = Number(props.getProperty('lastRowSent') || 1);
+  sendRows(sheet, Math.max(2, Math.min(sent + 1, last - 49)), last);
 }
 
 // Sends every response in the sheet. Ones already in the tracker are skipped, so it's safe to run again.
 function sendAllResponses() {
   const sheet = responseSheet();
-  const last = sheet.getLastRow();
-  const responses = [];
-  for (let row = 2; row <= last; row++) {
-    const r = responseFromRow(sheet, row);
-    if (r) responses.push(r);
-  }
-  let added = 0;
-  for (let i = 0; i < responses.length; i += 100) added += post(responses.slice(i, i + 100)).added;
-  const msg = added + ' new enquir' + (added === 1 ? 'y' : 'ies') + ' sent to the tracker (' + (responses.length - added) + ' were already there).';
+  const result = sendRows(sheet, 2, sheet.getLastRow());
+  const msg = result.added + ' new enquir' + (result.added === 1 ? 'y' : 'ies') + ' sent to the tracker (' + result.skipped + ' were already there).';
   try { SpreadsheetApp.getActive().toast(msg, 'Tracker'); } catch (err) {}
   Logger.log(msg);
 }
 
+function sendRows(sheet, from, to) {
+  const responses = [];
+  for (let row = from; row <= to; row++) {
+    const r = responseFromRow(sheet, row);
+    if (r) responses.push(r);
+  }
+  let added = 0, skipped = 0;
+  for (let i = 0; i < responses.length; i += 100) {
+    const result = post(responses.slice(i, i + 100));
+    added += result.added;
+    skipped += result.skipped;
+  }
+  PropertiesService.getScriptProperties().setProperty('lastRowSent', String(Math.max(to, 1)));
+  return { added, skipped };
+}
+
+// The tab with the form responses: the one linked to the form, else the one whose first heading is "Timestamp".
 function responseSheet() {
-  const ss = SpreadsheetApp.getActive();
-  return ss.getSheets().find((s) => s.getFormUrl()) || ss.getSheets()[0];
+  const sheets = SpreadsheetApp.getActive().getSheets();
+  return sheets.find((s) => s.getFormUrl()) ||
+    sheets.find((s) => String(s.getRange(1, 1).getValue()).trim() === 'Timestamp') ||
+    sheets[0];
 }
 
 function responseFromRow(sheet, row) {
@@ -1642,12 +1670,12 @@ async function adminGoogleForm() {
   const step = (...content) => h('li', {}, ...content);
   return [
     h('div', { class: 'head' }, h('h2', {}, 'Connect your Google Form'), h('button', { class: 'primary', onclick: copy }, 'Copy script')),
-    h('p', { class: 'muted' }, 'Every time someone fills in your Google Form, the enquiry appears here in the “New enquiry” stage by itself. This works through a small script in the spreadsheet that collects your form responses. You only set it up once.'),
+    h('p', { class: 'muted' }, 'Every time someone fills in your Google Form, the enquiry appears here in the “New enquiry” stage by itself. This works through a small script you add to the Google Sheet that collects your form responses. You only set it up once, and you only need the sheet, not the form.'),
     h('ol', { class: 'steps' },
-      step('Open the Google Form, go to the ', h('strong', {}, 'Responses'), ' tab and click ', h('strong', {}, 'View in Sheets'), ' (or “Link to Sheets”). This opens the response spreadsheet.'),
-      step('In the spreadsheet, click ', h('strong', {}, 'Extensions → Apps Script'), '. Delete anything in the editor, then click ', h('strong', {}, 'Copy script'), ' above and paste it in. Click the 💾 Save icon.'),
+      step('Open the Google Sheet that your form responses go into. You need to be able to edit it.'),
+      step('Click ', h('strong', {}, 'Extensions → Apps Script'), '. Delete anything in the editor, then click ', h('strong', {}, 'Copy script'), ' above and paste it in. Click the 💾 Save icon.'),
       step('At the top of the editor, choose ', h('strong', {}, 'setup'), ' from the function list and click ', h('strong', {}, 'Run'), '. Google asks you to allow access: choose your account, then ', h('em', {}, 'Advanced → Go to (project name) → Allow'), '.'),
-      step('That’s it. ', h('strong', {}, 'setup'), ' sends all the responses already in the sheet, and every new response from now on arrives by itself. Re-sending never creates duplicates. The spreadsheet also gets a ', h('strong', {}, 'Tracker'), ' menu to send everything again.')),
+      step('That’s it. ', h('strong', {}, 'setup'), ' sends all the responses already in the sheet. New responses arrive by themselves: straight away if the form is linked to the sheet, otherwise within 10 minutes. Re-sending never creates duplicates. The sheet also gets a ', h('strong', {}, 'Tracker'), ' menu to send everything again.')),
     box,
     h('h3', { style: { marginTop: '20px' } }, 'Which answer goes where'),
     h('p', { class: 'muted small' }, `${linked.length} fields are linked to a form question. To change one, or if you reword a question in the Google Form, edit the field in Form fields and update its “Google Form question”. Answers to questions that aren’t linked to a field are kept in “${activeFields().find((f) => f.type === 'textarea')?.label || 'the first long-text field'}”, so nothing is lost.`),
